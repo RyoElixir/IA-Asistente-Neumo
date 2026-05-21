@@ -18,7 +18,7 @@ st.markdown("Sube una radiografía frontal de tórax para obtener un pre-diagnó
 class DenseNet121_MCDropout(nn.Module):
     def __init__(self, dropout_rate=0.5):
         super(DenseNet121_MCDropout, self).__init__()
-        self.densenet = models.densenet121(weights=None) # Ya no bajamos de internet, cargaremos nuestros pesos
+        self.densenet = models.densenet121(weights=None)
         in_features = self.densenet.classifier.in_features
         self.densenet.classifier = nn.Sequential(
             nn.Dropout(p=dropout_rate),
@@ -29,7 +29,13 @@ class DenseNet121_MCDropout(nn.Module):
         )
 
     def forward(self, x):
-        return self.densenet(x)
+        # Reescribimos el paso hacia adelante para evitar el "inplace=True"
+        features = self.densenet.features(x)
+        out = torch.relu(features) # <-- Aplicamos un ReLU seguro
+        out = torch.nn.functional.adaptive_avg_pool2d(out, (1, 1))
+        out = torch.flatten(out, 1)
+        out = self.densenet.classifier(out)
+        return out
         
     def enable_dropout(self):
         for m in self.modules():
@@ -69,55 +75,57 @@ def mc_dropout_predict(model, image_tensor, num_passes=20):
 
 def generate_gradcam(model, image_tensor, original_image):
     model.eval()
-    gradients = []
-    activations = []
-
-    # 1. "Enganchar" la última capa neuronal para extraer sus matemáticas
-    def backward_hook(module, grad_input, grad_output):
-        gradients.append(grad_output[0])
-    def forward_hook(module, input, output):
-        activations.append(output)
-
-    target_layer = model.densenet.features[-1]
-    hook_f = target_layer.register_forward_hook(forward_hook)
-    hook_b = target_layer.register_full_backward_hook(backward_hook)
-
+    
+    features_blob = []
+    gradients_blob = []
+    
+    # 1. Enganchar un recolector de matemáticas directamente sobre el tensor
+    def hook_feature(module, input, output):
+        features_blob.append(output)
+        output.register_hook(lambda grad: gradients_blob.append(grad))
+        
+    target_layer = model.densenet.features
+    handle = target_layer.register_forward_hook(hook_feature)
+    
     # 2. Hacer que la IA evalúe la imagen
     output = model(image_tensor)
     pred_score = output[0, 0]
-
-    # 3. Calcular los gradientes (El por qué tomó la decisión)
+    
+    # 3. Calcular los gradientes (El "por qué" tomó la decisión)
     model.zero_grad()
     pred_score.backward(retain_graph=True)
-
-    # 4. Construir el mapa de calor matemáticamente
-    pooled_gradients = torch.mean(gradients[0], dim=[0, 2, 3])
-    for i in range(activations[0].shape[1]):
-        activations[0][:, i, :, :] *= pooled_gradients[i]
+    handle.remove() # Limpiamos el gancho para no saturar la memoria
+    
+    # 4. Extraer los números
+    activations = features_blob[0]
+    gradients = gradients_blob[0]
+    
+    # 5. Ecuación de Grad-CAM
+    pooled_gradients = torch.mean(gradients, dim=[0, 2, 3])
+    for i in range(activations.shape[1]):
+        activations[:, i, :, :] *= pooled_gradients[i]
         
-    heatmap = torch.mean(activations[0], dim=1).squeeze()
-    heatmap = F.relu(heatmap) # Ignorar valores negativos
-    heatmap /= torch.max(heatmap) # Normalizar de 0 a 1
+    heatmap = torch.mean(activations, dim=1).squeeze()
+    heatmap = torch.nn.functional.relu(heatmap)
+    
+    # Normalizar evitando división por cero
+    max_val = torch.max(heatmap)
+    if max_val > 0:
+        heatmap /= max_val
+        
     heatmap = heatmap.detach().cpu().numpy()
 
-    # Limpiar memoria
-    hook_f.remove()
-    hook_b.remove()
-
-    # 5. Colorear y superponer sobre la radiografía sin usar cv2
+    # 6. Colorear y superponer sobre la radiografía
     img_resized = original_image.resize((224, 224))
     img_array = np.array(img_resized) / 255.0
 
-    # Escalar el mapa de calor (7x7) al tamaño de la imagen (224x224)
     heatmap_img = Image.fromarray(np.uint8(255 * heatmap))
     heatmap_resized = heatmap_img.resize((224, 224), Image.Resampling.LANCZOS)
     heatmap_resized = np.array(heatmap_resized) / 255.0
 
-    # Aplicar el filtro de color médico (JET)
     cmap = plt.get_cmap('jet')
     heatmap_colored = cmap(heatmap_resized)[..., :3]
 
-    # Mezclar opacidades (50% radiografía, 50% mapa de calor)
     alpha = 0.5
     overlay = heatmap_colored * alpha + img_array * (1 - alpha)
     overlay = np.clip(overlay, 0, 1)
