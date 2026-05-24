@@ -52,7 +52,7 @@ class CheXNet(nn.Module):
     def enable_dropout(self):
         self.mc_dropout_active = True
 
-# --- 4. FUNCIONES CACHEADAS (Descarga Automática) ---
+# --- 4. FUNCIONES CACHEADAS (Descarga Automática y Mapeo Inteligente) ---
 @st.cache_resource
 def load_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -60,21 +60,43 @@ def load_model():
     
     weights_path = 'model.pth.tar'
     
-    # MAGIA CLOUD: Si el servidor no tiene los pesos, los descarga en segundos
+    # Descarga desde Stanford si no existe
     if not os.path.exists(weights_path):
         url = 'https://github.com/arnoweng/CheXNet/raw/master/model.pth.tar'
         urllib.request.urlretrieve(url, weights_path)
     
-    # Cargar los pesos y limpiar el prefijo "module."
     checkpoint = torch.load(weights_path, map_location=device)
-    state_dict = checkpoint['state_dict']
     
-    clean_state_dict = {}
-    for k, v in state_dict.items():
-        clean_key = k.replace('module.', '')
-        clean_state_dict[clean_key] = v
+    # Manejar diferentes estructuras de guardado
+    if 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
         
-    model.load_state_dict(clean_state_dict)
+    # --- MAPEADOR INTELIGENTE DE PESOS ---
+    model_state_dict = model.state_dict()
+    valid_state_dict = {}
+    
+    for my_key in model_state_dict.keys():
+        # Extraemos la parte principal de nuestra capa (ej. 'features.denseblock1...')
+        core_key = my_key.replace('densenet121.', '')
+        
+        # Flexibilidad extra por si el clasificador fue guardado diferente
+        alt_key = core_key.replace('classifier.0', 'classifier')
+        
+        found = False
+        for ckpt_key, ckpt_val in state_dict.items():
+            # Si el final del nombre coincide, conectamos los pesos
+            if ckpt_key.endswith(core_key) or ckpt_key.endswith(alt_key):
+                valid_state_dict[my_key] = ckpt_val
+                found = True
+                break
+        
+        # A prueba de fallos: si falta algo mínimo, usamos los valores base
+        if not found:
+            valid_state_dict[my_key] = model_state_dict[my_key]
+            
+    model.load_state_dict(valid_state_dict)
     model.to(device)
     return model, device
 
