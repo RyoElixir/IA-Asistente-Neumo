@@ -207,7 +207,12 @@ if uploaded_file is not None and modelo_cargado:
     if st.button("Generar Diagnóstico Multietiqueta", type="primary"):
         with st.spinner('Analizando 14 patologías neuronales...'):
             img_tensor = preprocess_image(original_image)
-            prob_medias, incertidumbres = mc_dropout_predict(model, img_tensor)
+            
+            # --- PREDICCIÓN DETERMINISTA ---
+            probabilidades = predict_deterministic(model, img_tensor)
+            
+            # --- GRAD-CAM ---
+            # Asegúrate de quitar cualquier 'model.mc_dropout_active = False' si lo tenías en tu función generate_gradcam
             gradcam_img, top_disease = generate_gradcam(model, img_tensor, original_image)
             
             with col2:
@@ -222,17 +227,15 @@ if uploaded_file is not None and modelo_cargado:
         detectado_algo = False
         
         for idx, disease in enumerate(DISEASES):
-            prob = prob_medias[idx]
-            incert = incertidumbres[idx]
-            hallazgos_significativos.append(f"- {disease}: Probabilidad {prob*100:.1f}%, Incertidumbre ±{incert*100:.1f}%")
+            prob = probabilidades[idx]
+            hallazgos_significativos.append(f"- {disease}: Probabilidad {prob*100:.1f}%")
             
             # Umbral clínico: Solo mostramos hallazgos > 15% de probabilidad
             if prob > 0.15:
                 detectado_algo = True
-                col_pat, col_conf, col_inc = st.columns(3)
+                col_pat, col_conf = st.columns([2, 1])
                 col_pat.markdown(f"**🔹 {disease}**")
-                col_conf.metric("Confianza", f"{prob*100:.1f}%")
-                col_inc.metric("Incertidumbre", f"{incert*100:.1f}%", delta_color="inverse" if incert > 0.05 else "normal")
+                col_conf.metric("Confianza de IA", f"{prob*100:.1f}%")
                 st.markdown("---")
                 
         if not detectado_algo:
@@ -244,7 +247,6 @@ if uploaded_file is not None and modelo_cargado:
             with st.spinner('Redactando informe médico multietiqueta...'):
                 try:
                     genai.configure(api_key=gemini_key)
-                    # Usamos la cuota gratuita más generosa
                     llm_model = genai.GenerativeModel('gemini-1.5-flash')
                     lista_hallazgos_txt = "\n".join(hallazgos_significativos)
                     
@@ -255,14 +257,14 @@ if uploaded_file is not None and modelo_cargado:
                     {lista_hallazgos_txt}
                     
                     Redacta un informe clínico breve estructurado en:
-                    1. HALLAZGOS PRINCIPALES (Menciona solo las patologías con probabilidad significativa y su incertidumbre).
-                    2. IMPRESIÓN CONCLUSIVA (Si hay alta incertidumbre o peligro, emite una ALERTA CLÍNICA).
+                    1. HALLAZGOS PRINCIPALES (Menciona solo las patologías con probabilidad significativa).
+                    2. IMPRESIÓN CONCLUSIVA.
                     """
                     response = llm_model.generate_content(prompt)
                     st.write(response.text)
                 except Exception as e:
                     error_msg = str(e)
                     if "429" in error_msg or "quota" in error_msg.lower():
-                        st.warning("⏳ La IA está procesando demasiadas solicitudes (Límite de cuota gratuita de Google). Espera unos segundos y vuelve a intentar.")
+                        st.warning("⏳ La IA está procesando demasiadas solicitudes. Espera unos segundos e intenta de nuevo.")
                     else:
-                        st.error(f"Error al generar el reporte extendido: {e}")
+                        st.error(f"Error al generar el reporte: {e}")
