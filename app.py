@@ -42,22 +42,6 @@ class CheXNet(nn.Module):
         out = self.densenet121.classifier(out)
         return out
 
-    def forward(self, x):
-        features = self.densenet121.features(x)
-        out = torch.relu(features) 
-        out = torch.nn.functional.adaptive_avg_pool2d(out, (1, 1))
-        out = torch.flatten(out, 1)
-        
-        # Inyectamos Dropout manualmente solo si está activo (para calcular incertidumbre)
-        if self.mc_dropout_active:
-            out = torch.nn.functional.dropout(out, p=0.2, training=True)
-            
-        out = self.densenet121.classifier(out)
-        return out
-        
-    def enable_dropout(self):
-        self.mc_dropout_active = True
-
 # --- 4. FUNCIONES CACHEADAS (Descarga Automática y Mapeo Inteligente) ---
 @st.cache_resource
 def load_model():
@@ -66,39 +50,31 @@ def load_model():
     
     weights_path = 'model.pth.tar'
     
-    # Descarga desde Stanford si no existe
     if not os.path.exists(weights_path):
         url = 'https://github.com/arnoweng/CheXNet/raw/master/model.pth.tar'
         urllib.request.urlretrieve(url, weights_path)
     
     checkpoint = torch.load(weights_path, map_location=device)
     
-    # Manejar diferentes estructuras de guardado
     if 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
     else:
         state_dict = checkpoint
         
-    # --- MAPEADOR INTELIGENTE DE PESOS ---
     model_state_dict = model.state_dict()
     valid_state_dict = {}
     
     for my_key in model_state_dict.keys():
-        # Extraemos la parte principal de nuestra capa (ej. 'features.denseblock1...')
         core_key = my_key.replace('densenet121.', '')
-        
-        # Flexibilidad extra por si el clasificador fue guardado diferente
         alt_key = core_key.replace('classifier.0', 'classifier')
         
         found = False
         for ckpt_key, ckpt_val in state_dict.items():
-            # Si el final del nombre coincide, conectamos los pesos
             if ckpt_key.endswith(core_key) or ckpt_key.endswith(alt_key):
                 valid_state_dict[my_key] = ckpt_val
                 found = True
                 break
         
-        # A prueba de fallos: si falta algo mínimo, usamos los valores base
         if not found:
             valid_state_dict[my_key] = model_state_dict[my_key]
             
@@ -106,7 +82,7 @@ def load_model():
     model.to(device)
     return model, device
 
-# Intentar cargar modelo
+# Carga del modelo con manejo de errores
 try:
     with st.spinner('Cargando motor de IA (Puede tardar 1 minuto la primera vez si está descargando pesos)...'):
         model, device = load_model()
@@ -132,7 +108,6 @@ def predict_deterministic(model, image_tensor):
 
 def generate_gradcam(model, image_tensor, original_image):
     model.eval()
-   
     
     features_blob = []
     gradients_blob = []
@@ -146,7 +121,6 @@ def generate_gradcam(model, image_tensor, original_image):
     
     output = model(image_tensor)
     
-    # Encontrar la enfermedad con mayor probabilidad para pintar el mapa de calor
     top_class = torch.argmax(output).item()
     pred_score = output[0, top_class]
     
@@ -191,7 +165,7 @@ with st.sidebar:
     st.header("⚙️ Configuración")
     gemini_key = st.text_input("Ingresa tu Gemini API Key:", type="password")
     st.markdown("---")
-    st.info("**Modelo Multietiqueta:** Red pre-entrenada con 112,120 radiografías (NIH). Evalúa 14 patologías independientes.")
+    st.info("**Modelo Multietiqueta:** Red pre-entrenada con 112,120 radiografías (NIH). Evalúa 14 patologías independientes de forma determinista.")
 
 # --- 6. INTERFAZ PRINCIPAL ---
 uploaded_file = st.file_uploader("Selecciona una radiografía (JPEG/PNG)...", type=["jpg", "jpeg", "png"])
@@ -208,11 +182,7 @@ if uploaded_file is not None and modelo_cargado:
         with st.spinner('Analizando 14 patologías neuronales...'):
             img_tensor = preprocess_image(original_image)
             
-            # --- PREDICCIÓN DETERMINISTA ---
             probabilidades = predict_deterministic(model, img_tensor)
-            
-            # --- GRAD-CAM ---
-            # Asegúrate de quitar cualquier 'model.mc_dropout_active = False' si lo tenías en tu función generate_gradcam
             gradcam_img, top_disease = generate_gradcam(model, img_tensor, original_image)
             
             with col2:
