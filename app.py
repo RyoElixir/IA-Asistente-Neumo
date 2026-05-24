@@ -132,7 +132,7 @@ def predict_deterministic(model, image_tensor):
 
 def generate_gradcam(model, image_tensor, original_image):
     model.eval()
-    model.mc_dropout_active = False
+   
     
     features_blob = []
     gradients_blob = []
