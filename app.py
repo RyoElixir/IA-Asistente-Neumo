@@ -29,12 +29,18 @@ class CheXNet(nn.Module):
         super(CheXNet, self).__init__()
         self.densenet121 = models.densenet121(weights=None)
         in_features = self.densenet121.classifier.in_features
-        # La arquitectura original va directo a 14 salidas con Sigmoid interno
         self.densenet121.classifier = nn.Sequential(
             nn.Linear(in_features, len(DISEASES)),
             nn.Sigmoid()
         )
-        self.mc_dropout_active = False
+
+    def forward(self, x):
+        features = self.densenet121.features(x)
+        out = torch.relu(features) 
+        out = torch.nn.functional.adaptive_avg_pool2d(out, (1, 1))
+        out = torch.flatten(out, 1)
+        out = self.densenet121.classifier(out)
+        return out
 
     def forward(self, x):
         features = self.densenet121.features(x)
