@@ -6,14 +6,16 @@ from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 import google.generativeai as genai
+import os
+import urllib.request
 
 # --- 1. CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Asistente Radiológico IA", page_icon="🫁", layout="wide")
 
 st.title("🫁 Asistente de Diagnóstico Multietiqueta (14 Patologías)")
-st.markdown("Sube una radiografía frontal de tórax. El modelo evaluará 14 patologías torácicas de forma simultánea e independiente.")
+st.markdown("Sube una radiografía frontal de tórax. El modelo evaluará 14 patologías torácicas de forma simultánea.")
 
-# --- 2. LISTA OFICIAL DE PATOLOGÍAS (NIH ChestX-ray14) ---
+# --- 2. LISTAS OFICIALES ---
 DISEASES = [
     "Atelectasia", "Cardiomegalia", "Derrame Pleural", "Infiltración",
     "Masa", "Nódulo", "Neumonía", "Neumotórax",
@@ -21,50 +23,68 @@ DISEASES = [
     "Engrosamiento Pleural", "Hernia"
 ]
 
-# --- 3. DEFINICIÓN DEL MODELO (Multietiqueta y Seguro para Hooks) ---
-class DenseNet121_MultiLabel(nn.Module):
-    def __init__(self, dropout_rate=0.5):
-        super(DenseNet121_MultiLabel, self).__init__()
-        self.densenet = models.densenet121(weights=None)
-        in_features = self.densenet.classifier.in_features
-        self.densenet.classifier = nn.Sequential(
-            nn.Dropout(p=dropout_rate),
-            nn.Linear(in_features, 512),
-            nn.ReLU(),
-            nn.Dropout(p=dropout_rate),
-            nn.Linear(512, len(DISEASES)) # 14 Salidas
+# --- 3. ARQUITECTURA EXACTA DE CHEXNET (STANFORD) ---
+class CheXNet(nn.Module):
+    def __init__(self):
+        super(CheXNet, self).__init__()
+        self.densenet121 = models.densenet121(weights=None)
+        in_features = self.densenet121.classifier.in_features
+        # La arquitectura original va directo a 14 salidas con Sigmoid interno
+        self.densenet121.classifier = nn.Sequential(
+            nn.Linear(in_features, len(DISEASES)),
+            nn.Sigmoid()
         )
+        self.mc_dropout_active = False
 
     def forward(self, x):
-        # Reescribimos el forward para evitar el inplace=True de ReLU y que el Grad-CAM no falle
-        features = self.densenet.features(x)
+        features = self.densenet121.features(x)
         out = torch.relu(features) 
         out = torch.nn.functional.adaptive_avg_pool2d(out, (1, 1))
         out = torch.flatten(out, 1)
-        out = self.densenet.classifier(out)
+        
+        # Inyectamos Dropout manualmente solo si está activo (para calcular incertidumbre)
+        if self.mc_dropout_active:
+            out = torch.nn.functional.dropout(out, p=0.2, training=True)
+            
+        out = self.densenet121.classifier(out)
         return out
         
     def enable_dropout(self):
-        for m in self.modules():
-            if m.__class__.__name__.startswith('Dropout'):
-                m.train()
+        self.mc_dropout_active = True
 
-# --- 4. FUNCIONES CACHEADAS ---
+# --- 4. FUNCIONES CACHEADAS (Descarga Automática) ---
 @st.cache_resource
 def load_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = DenseNet121_MultiLabel()
-    # AQUÍ CARGAREMOS LOS PESOS DE LAS 14 ENFERMEDADES
-    model.load_state_dict(torch.load('chexnet_14_weights.pth', map_location=device))
+    model = CheXNet()
+    
+    weights_path = 'model.pth.tar'
+    
+    # MAGIA CLOUD: Si el servidor no tiene los pesos, los descarga en segundos
+    if not os.path.exists(weights_path):
+        url = 'https://github.com/arnoweng/CheXNet/raw/master/model.pth.tar'
+        urllib.request.urlretrieve(url, weights_path)
+    
+    # Cargar los pesos y limpiar el prefijo "module."
+    checkpoint = torch.load(weights_path, map_location=device)
+    state_dict = checkpoint['state_dict']
+    
+    clean_state_dict = {}
+    for k, v in state_dict.items():
+        clean_key = k.replace('module.', '')
+        clean_state_dict[clean_key] = v
+        
+    model.load_state_dict(clean_state_dict)
     model.to(device)
     return model, device
 
-# Usamos try-except por si aún no has subido el nuevo archivo de pesos
+# Intentar cargar modelo
 try:
-    model, device = load_model()
-    modelo_cargado = True
-except FileNotFoundError:
-    st.error("⚠️ Falta el archivo 'chexnet_14_weights.pth'. Por favor súbelo a tu repositorio.")
+    with st.spinner('Cargando motor de IA (Puede tardar 1 minuto la primera vez si está descargando pesos)...'):
+        model, device = load_model()
+        modelo_cargado = True
+except Exception as e:
+    st.error(f"Error al cargar el modelo: {e}")
     modelo_cargado = False
 
 def preprocess_image(image):
@@ -83,30 +103,31 @@ def mc_dropout_predict(model, image_tensor, num_passes=20):
     with torch.no_grad():
         for _ in range(num_passes):
             output = model(image_tensor)
-            # Aplicamos Sigmoid a las 14 salidas simultáneamente
-            probs = torch.sigmoid(output).cpu().numpy()[0]
+            probs = output.cpu().numpy()[0] # La arquitectura ya aplica Sigmoid
             all_passes_preds.append(probs)
             
+    model.mc_dropout_active = False # Apagar después de usar
     mean_preds = np.mean(all_passes_preds, axis=0)
     std_preds = np.std(all_passes_preds, axis=0)
     return mean_preds, std_preds
 
 def generate_gradcam(model, image_tensor, original_image):
     model.eval()
+    model.mc_dropout_active = False
+    
     features_blob = []
     gradients_blob = []
     
-    # Enganchar el recolector matemáticamente
     def hook_feature(module, input, output):
         features_blob.append(output)
         output.register_hook(lambda grad: gradients_blob.append(grad))
         
-    target_layer = model.densenet.features
+    target_layer = model.densenet121.features
     handle = target_layer.register_forward_hook(hook_feature)
     
     output = model(image_tensor)
     
-    # Extraer el mapa de la enfermedad con MAYOR probabilidad detectada
+    # Encontrar la enfermedad con mayor probabilidad para pintar el mapa de calor
     top_class = torch.argmax(output).item()
     pred_score = output[0, top_class]
     
@@ -130,7 +151,6 @@ def generate_gradcam(model, image_tensor, original_image):
         
     heatmap = heatmap.detach().cpu().numpy()
 
-    # Colorear sin usar CV2
     img_resized = original_image.resize((224, 224))
     img_array = np.array(img_resized) / 255.0
 
@@ -152,7 +172,7 @@ with st.sidebar:
     st.header("⚙️ Configuración")
     gemini_key = st.text_input("Ingresa tu Gemini API Key:", type="password")
     st.markdown("---")
-    st.info("**Modelo Multietiqueta:** Basado en la arquitectura CheXNet evaluando 14 patologías simultáneas.")
+    st.info("**Modelo Multietiqueta:** Red pre-entrenada con 112,120 radiografías (NIH). Evalúa 14 patologías independientes.")
 
 # --- 6. INTERFAZ PRINCIPAL ---
 uploaded_file = st.file_uploader("Selecciona una radiografía (JPEG/PNG)...", type=["jpg", "jpeg", "png"])
@@ -187,7 +207,7 @@ if uploaded_file is not None and modelo_cargado:
             incert = incertidumbres[idx]
             hallazgos_significativos.append(f"- {disease}: Probabilidad {prob*100:.1f}%, Incertidumbre ±{incert*100:.1f}%")
             
-            # Solo mostramos en pantalla los hallazgos con más de un 15% de probabilidad
+            # Umbral clínico: Solo mostramos hallazgos > 15% de probabilidad
             if prob > 0.15:
                 detectado_algo = True
                 col_pat, col_conf, col_inc = st.columns(3)
@@ -205,7 +225,7 @@ if uploaded_file is not None and modelo_cargado:
             with st.spinner('Redactando informe médico multietiqueta...'):
                 try:
                     genai.configure(api_key=gemini_key)
-                    # Cambiamos a gemini-1.5-flash para tener una cuota gratuita más holgada
+                    # Usamos la cuota gratuita más generosa
                     llm_model = genai.GenerativeModel('gemini-1.5-flash')
                     lista_hallazgos_txt = "\n".join(hallazgos_significativos)
                     
@@ -224,6 +244,6 @@ if uploaded_file is not None and modelo_cargado:
                 except Exception as e:
                     error_msg = str(e)
                     if "429" in error_msg or "quota" in error_msg.lower():
-                        st.warning("⏳ La IA está procesando demasiadas solicitudes (Límite de cuota gratuita de Google). Espera unos segundos y vuelve a presionar el botón.")
+                        st.warning("⏳ La IA está procesando demasiadas solicitudes (Límite de cuota gratuita de Google). Espera unos segundos y vuelve a intentar.")
                     else:
-                        st.error(f"Ocurrió un error al contactar a la IA: {e}")
+                        st.error(f"Error al generar el reporte extendido: {e}")
