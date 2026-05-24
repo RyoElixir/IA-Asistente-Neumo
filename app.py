@@ -123,21 +123,12 @@ def preprocess_image(image):
     ])
     return transform(image).unsqueeze(0).to(device)
 
-def mc_dropout_predict(model, image_tensor, num_passes=20):
+def predict_deterministic(model, image_tensor):
     model.eval()
-    model.enable_dropout()
-    all_passes_preds = []
-    
     with torch.no_grad():
-        for _ in range(num_passes):
-            output = model(image_tensor)
-            probs = output.cpu().numpy()[0] # La arquitectura ya aplica Sigmoid
-            all_passes_preds.append(probs)
-            
-    model.mc_dropout_active = False # Apagar después de usar
-    mean_preds = np.mean(all_passes_preds, axis=0)
-    std_preds = np.std(all_passes_preds, axis=0)
-    return mean_preds, std_preds
+        output = model(image_tensor)
+        probs = output.cpu().numpy()[0]
+    return probs
 
 def generate_gradcam(model, image_tensor, original_image):
     model.eval()
