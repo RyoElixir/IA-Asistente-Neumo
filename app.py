@@ -121,7 +121,7 @@ def generate_gradcam(model, image_tensor, original_image):
     
     output = model(image_tensor)
     
-    top_class = 1  # El índice 1 en nuestra lista DISEASES corresponde a "Cardiomegalia"
+    top_class = torch.argmax(output).item()
     pred_score = output[0, top_class]
     
     model.zero_grad()
