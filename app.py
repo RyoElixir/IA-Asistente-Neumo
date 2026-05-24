@@ -217,7 +217,7 @@ if uploaded_file is not None and modelo_cargado:
             with st.spinner('Redactando informe médico multietiqueta...'):
                 try:
                     genai.configure(api_key=gemini_key)
-                    llm_model = genai.GenerativeModel('gemini-1.5-flash')
+                    llm_model = genai.GenerativeModel('gemini-2.5-flash')
                     lista_hallazgos_txt = "\n".join(hallazgos_significativos)
                     
                     prompt = f"""
